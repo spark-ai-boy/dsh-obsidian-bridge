@@ -249,6 +249,11 @@ export function parseNote({ path, raw, mtime, size, maxChunkChars = 2200 }) {
       const searchText = [title, path, ...headingPath, ...tags, part.text].join("\n");
       const chunkHash = sha1(searchText);
       chunks.push({
+        // Content-addressed id: stable across position shifts so a mid-note
+        // edit keeps the vector cache valid for every unchanged chunk. The
+        // leading ordinal only disambiguates two identical sections within
+        // the same note and never keys the vector cache (rebuild() matches
+        // on `hash`).
         id: `${path}#${chunks.length}-${chunkHash.slice(0, 8)}`,
         notePath: path,
         title,

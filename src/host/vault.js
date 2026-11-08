@@ -298,7 +298,10 @@ export class VaultIndex {
         const oldVectors = new Map();
         if (this.settings.indexMode !== "keyword" && this.vectors.length === this.chunks.length) {
           this.chunks.forEach((chunk, index) => {
-            if (this.hasVector(index)) oldVectors.set(chunk.id, this.vectors[index]);
+            // Key the cache by content hash, not chunk id: the id embeds the
+            // chunk's positional index, so inserting a line mid-note shifted
+            // every later id and invalidated vectors of unchanged chunks.
+            if (this.hasVector(index)) oldVectors.set(chunk.hash, this.vectors[index]);
           });
         }
 
@@ -329,8 +332,8 @@ export class VaultIndex {
         this.notes = notes;
         this.chunks = chunks;
         this.files = files;
-        this.vectors = chunks.map((chunk) => oldVectors.get(chunk.id));
-        this.vectorMask = chunks.map((chunk) => oldVectors.has(chunk.id));
+        this.vectors = chunks.map((chunk) => oldVectors.get(chunk.hash));
+        this.vectorMask = chunks.map((chunk) => oldVectors.has(chunk.hash));
         this.buildPostings();
         this.settings.lastIndexedAt = new Date().toISOString();
         await this.settingsStore.update({ lastIndexedAt: this.settings.lastIndexedAt });
