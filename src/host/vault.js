@@ -1,5 +1,5 @@
 import { watch } from "node:fs";
-import { mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { embedTexts, testEmbedding } from "./embeddings.js";
 import {
@@ -989,7 +989,18 @@ export class VaultIndex {
       vectorCount: embedded,
       dimensions
     };
-    await writeFile(join(this.dataDir, "index.json"), JSON.stringify(index), { mode: 0o600 });
+    // Write both files to a temp path first and rename over the target, so a
+    // crash mid-save cannot leave a truncated index.json (which loadIndex()
+    // treats as invalid and discards, triggering a full re-embed). index.json
+    // is committed last: it is the marker that the matching vectors.bin is
+    // complete.
+    await this.writeAtomic(join(this.dataDir, "vectors.bin"), () =>
+      this.serializeVectors(dimensions)
+    );
+    await this.writeAtomic(join(this.dataDir, "index.json"), () => JSON.stringify(index));
+  }
+
+  async serializeVectors(dimensions) {
     if (dimensions > 0 && this.chunks.length > 0) {
       const buffer = Buffer.alloc(this.chunks.length * dimensions * 4);
       let offset = 0;
@@ -1003,10 +1014,16 @@ export class VaultIndex {
           offset += dimensions * 4;
         }
       }
-      await writeFile(join(this.dataDir, "vectors.bin"), buffer, { mode: 0o600 });
-    } else {
-      await writeFile(join(this.dataDir, "vectors.bin"), Buffer.alloc(0), { mode: 0o600 });
+      return buffer;
     }
+    return Buffer.alloc(0);
+  }
+
+  async writeAtomic(targetPath, produce) {
+    const tmpPath = `${targetPath}.tmp`;
+    const payload = await produce();
+    await writeFile(tmpPath, payload, { mode: 0o600 });
+    await rename(tmpPath, targetPath);
   }
 
   async loadIndex() {
