@@ -281,7 +281,7 @@ export function registerTools(ctx, service) {
       render: (_args, value) => text(JSON.stringify(value, null, 2))
     },
     async execute() {
-      return service.status();
+      return service.indexStatus();
     },
     presentCall: () => present("read", "Obsidian index status")
   }));
