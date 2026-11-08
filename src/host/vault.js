@@ -380,6 +380,39 @@ export class VaultIndex {
     this.vocabulary = [...this.postings.keys()];
   }
 
+  /**
+   * Embed one batch with a retry, then bisect on persistent failure so a
+   * single rejected text (gateway content filters drop the connection for
+   * patterns like `$ curl ...` or `prompt (...)` inside technical notes)
+   * cannot abort the whole embedding run. Rejected texts resolve to `null`
+   * and stay unvectorized; everything else is embedded normally.
+   */
+  async embedBatchWithIsolation(batch) {
+    const texts = () => batch.map((item) => item.chunk.searchText || item.chunk.text);
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        return await embedTexts(this.settings, texts());
+      } catch (error) {
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+      }
+    }
+    if (batch.length === 1) {
+      this.logger?.warn?.(
+        `[vault-studio] embedding service keeps rejecting chunk ${batch[0].chunk.id} (${batch[0].chunk.notePath}); skipping it`
+      );
+      return [null];
+    }
+    const mid = Math.ceil(batch.length / 2);
+    const halves = [batch.slice(0, mid), batch.slice(mid)];
+    const vectors = [];
+    for (const half of halves) {
+      vectors.push(...(await this.embedBatchWithIsolation(half)));
+    }
+    return vectors;
+  }
+
   async embedPending() {
     if (this.disposed) return [];
     if (this.embeddingTask) return this.embeddingTask;
@@ -406,12 +439,15 @@ export class VaultIndex {
         this.embeddingError = "";
         for (let index = 0; index < pending.length; index += 24) {
           const batch = pending.slice(index, index + 24);
-          const vectors = await embedTexts(
-            this.settings,
-            batch.map((item) => item.chunk.searchText || item.chunk.text)
-          );
+          const vectors = await this.embedBatchWithIsolation(batch);
           for (let offset = 0; offset < batch.length; offset += 1) {
             const vector = vectors[offset];
+            if (vector === null) {
+              // The embedding service permanently rejected this text (e.g. a
+              // gateway-side content filter). Leave it unvectorized instead of
+              // aborting the whole embedding run.
+              continue;
+            }
             if (!Array.isArray(vector) || !vector.length) throw new Error("Embedding service returned an empty vector.");
             if (
               this.settings.embeddingDimensions > 0 &&

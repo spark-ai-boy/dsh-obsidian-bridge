@@ -189,3 +189,58 @@ test("semantic mode embeds chunks and ranks by vector", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("one poisoned text no longer aborts the embedding run", async () => {
+  const root = await fixture();
+  let requests = 0;
+  const server = http.createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const payload = JSON.parse(body);
+    const texts = Array.isArray(payload.input) ? payload.input : [payload.prompt];
+    requests += 1;
+    // Reject any batch that still contains the poisoned text, the way a
+    // gateway-side content filter drops the connection without a response.
+    if (texts.some((text) => text.includes("$ curl"))) {
+      req.socket.destroy();
+      return;
+    }
+    const data = texts.map((text) => ({ embedding: [0.5, 0.5, 0.2, 0.3, 0.4] }));
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  await writeFile(
+    join(root, "技术", "Shell示例.md"),
+    "# Shell 示例\n\n下面这个命令会被网关拦截。\n\n```bash\n$ curl http://prometheus:9090/api/v1/query\n```\n\n结尾还有正常内容。\n"
+  );
+  const index = new VaultIndex({
+    config: {
+      vaultPath: root,
+      dataDir: join(root, ".data"),
+      indexMode: "hybrid",
+      watch: false,
+      embeddingUrl: `http://127.0.0.1:${port}/v1/embeddings`,
+      embeddingModel: "mock-embedding",
+      embeddingDimensions: 5
+    }
+  });
+  try {
+    await index.initialize();
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      if (index.status().embeddingReady) break;
+      if (index.status().embeddingError) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const status = index.status();
+    assert.equal(status.embeddingReady, true, "embedding run must complete despite the poisoned chunk");
+    assert.equal(status.embeddingError, "");
+    assert.ok(status.vectors >= status.chunks - 1, "all clean chunks must be embedded");
+    assert.ok(requests > 4, "bisection must have isolated the poisoned chunk");
+  } finally {
+    index.dispose();
+    server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
