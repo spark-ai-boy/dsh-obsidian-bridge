@@ -1042,16 +1042,23 @@ export class VaultIndex {
       if (dimensions > 0 && Number(index.vectorCount) > 0) {
         try {
           const buffer = await readFile(join(this.dataDir, "vectors.bin"));
-          for (let indexOffset = 0; indexOffset < this.chunks.length; indexOffset += 1) {
-            if (!mask[indexOffset]) continue;
-            const start = indexOffset * dimensions * 4;
-            if (start + dimensions * 4 > buffer.length) break;
-            const vector = new Float32Array(dimensions);
-            for (let dimension = 0; dimension < dimensions; dimension += 1) {
-              vector[dimension] = buffer.readFloatLE(start + dimension * 4);
+          const expected = this.chunks.length * dimensions * 4;
+          if (buffer.length >= expected) {
+            // View the buffer directly: one Float32Array over the whole file
+            // (4-byte aligned by construction) instead of chunks.length ×
+            // dimensions readFloatLE calls — for 32k chunks at 4096 dims that
+            // is 131M function calls per session startup.
+            for (let indexOffset = 0; indexOffset < this.chunks.length; indexOffset += 1) {
+              if (!mask[indexOffset]) continue;
+              const start = indexOffset * dimensions * 4;
+              if (start + dimensions * 4 > buffer.length) break;
+              this.vectors[indexOffset] = new Float32Array(
+                buffer.buffer,
+                buffer.byteOffset + start,
+                dimensions
+              );
+              this.vectorMask[indexOffset] = true;
             }
-            this.vectors[indexOffset] = vector;
-            this.vectorMask[indexOffset] = true;
           }
         } catch {
           this.vectors = this.chunks.map(() => undefined);
