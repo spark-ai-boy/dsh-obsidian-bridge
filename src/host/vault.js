@@ -590,6 +590,14 @@ export class VaultIndex {
   }
 
   status() {
+    let firstPendingChunk = null;
+    if (this.settings.indexMode !== "keyword") {
+      const index = this.chunks.findIndex((_chunk, position) => !this.hasVector(position));
+      if (index >= 0) {
+        const chunk = this.chunks[index];
+        firstPendingChunk = { id: chunk.id, notePath: chunk.notePath };
+      }
+    }
     return {
       building: this.building,
       buildProgress: this.buildProgress,
@@ -597,7 +605,9 @@ export class VaultIndex {
       embeddingProgress: this.embeddingProgress,
       embeddingError: this.embeddingError,
       chunks: this.chunks.length,
-      vectors: this.embeddedCount()
+      vectors: this.embeddedCount(),
+      pending: Math.max(0, this.chunks.length - this.embeddedCount()),
+      firstPendingChunk
     };
   }
 
