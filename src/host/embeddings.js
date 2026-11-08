@@ -25,9 +25,10 @@ function validUrl(value) {
 }
 
 function abortSignal(ms) {
-  if (typeof AbortSignal.timeout === "function") return AbortSignal.timeout(ms);
+  const timeout = Number(ms) > 0 ? Number(ms) : 90_000;
+  if (typeof AbortSignal.timeout === "function") return AbortSignal.timeout(timeout);
   const controller = new AbortController();
-  setTimeout(() => controller.abort(new Error("embedding request timed out")), ms).unref?.();
+  setTimeout(() => controller.abort(new Error("embedding request timed out")), timeout).unref?.();
   return controller.signal;
 }
 
@@ -37,7 +38,7 @@ export async function embedTexts(settings, texts, signal) {
     throw new Error("Embedding service URL must be an http(s) endpoint.");
   }
   const url = settings.embeddingUrl.trim();
-  const timeout = abortSignal(90_000);
+  const timeout = abortSignal(settings.embeddingTimeoutMs);
   const signals = signal ? [signal, timeout] : [timeout];
   const requestSignal =
     typeof AbortSignal.any === "function" ? AbortSignal.any(signals) : timeout;

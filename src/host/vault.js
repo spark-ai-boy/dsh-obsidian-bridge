@@ -404,8 +404,9 @@ export class VaultIndex {
         }
         this.embeddingReady = false;
         this.embeddingError = "";
-        for (let index = 0; index < pending.length; index += 24) {
-          const batch = pending.slice(index, index + 24);
+        const batchSize = Math.max(1, Math.min(128, Number(this.settings.embeddingBatchSize) || 24));
+        for (let index = 0; index < pending.length; index += batchSize) {
+          const batch = pending.slice(index, index + batchSize);
           const vectors = await embedTexts(
             this.settings,
             batch.map((item) => item.chunk.searchText || item.chunk.text)
@@ -426,7 +427,7 @@ export class VaultIndex {
           }
           this.embeddingProgress = Math.round(((index + batch.length) / pending.length) * 100);
           if (this.disposed) return;
-          if (index === 0 || index % (24 * 8) === 0 || index + batch.length >= pending.length) {
+          if (index === 0 || (index / batchSize) % 8 === 0 || index + batch.length >= pending.length) {
             await this.saveIndex();
           }
         }

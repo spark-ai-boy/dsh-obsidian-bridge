@@ -14,6 +14,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   embeddingDimensions: 1024,
   embeddingApiKey: "",
   embeddingConfigured: false,
+  embeddingBatchSize: 24,
+  embeddingTimeoutMs: 90_000,
   conversationEnabled: false,
   autoApproveWrites: false,
   watch: true,
