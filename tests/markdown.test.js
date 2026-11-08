@@ -34,3 +34,13 @@ test("tokenizes Chinese and Latin text", () => {
   assert.ok(tokens.includes("知识"));
   assert.ok(tokens.includes("管理"));
 });
+
+test("splits a single paragraph exceeding maxChunkChars (giant table)", () => {
+  const row = `| ${"x".repeat(990)} |`;
+  const raw = `# Model\n\n| head | a |\n| --- | --- |\n${Array(40).fill(row).join("\n")}\n`;
+  const note = parseNote({ path: "t/big.md", raw, mtime: 0, size: raw.length, maxChunkChars: 2200 });
+  assert.ok(note.chunks.length > 1, "giant single paragraph must be split");
+  for (const chunk of note.chunks) {
+    assert.ok(chunk.text.length <= 2200, `chunk length ${chunk.text.length} exceeds maxChunkChars`);
+  }
+});
