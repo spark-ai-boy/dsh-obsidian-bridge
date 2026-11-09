@@ -32,7 +32,10 @@ export class UsageStore {
     this.dataDir = dataDir;
     this.path = join(dataDir, "usage.json");
     this.data = emptyUsage();
+    // A failed write must not poison the queue: later counters still retry
+    // with a fresh snapshot, and record() propagates its own disk error.
     this.writeChain = Promise.resolve();
+    this.pendingSnapshot = Promise.resolve();
     this.ready = this.load();
   }
 
@@ -40,12 +43,24 @@ export class UsageStore {
     await mkdir(this.dataDir, { recursive: true, mode: 0o700 });
     try {
       const parsed = JSON.parse(await readFile(this.path, "utf8"));
+      const counters = (group) => {
+        const result = {};
+        const source = group && typeof group === "object" && !Array.isArray(group) ? group : {};
+        for (const [key, count] of Object.entries(source)) {
+          if (key !== "__proto__" && key !== "constructor" && key !== "prototype" &&
+            /^[0-9A-Za-z_.\/ -]{1,128}$/.test(key) && Number.isSafeInteger(count) && count >= 0) result[key] = count;
+        }
+        return result;
+      };
+      const byTool = counters(parsed?.byTool);
       this.data = {
         ...emptyUsage(),
-        ...(parsed && typeof parsed === "object" ? parsed : {}),
-        byTool: parsed && typeof parsed.byTool === "object" ? { ...parsed.byTool } : {},
-        daily: parsed && typeof parsed.daily === "object" ? { ...parsed.daily } : {},
-        monthly: parsed && typeof parsed.monthly === "object" ? { ...parsed.monthly } : {}
+        total: Number.isSafeInteger(parsed?.total) && parsed.total >= 0
+          ? parsed.total : Object.values(byTool).reduce((sum, count) => sum + count, 0),
+        byTool,
+        daily: counters(parsed?.daily),
+        monthly: counters(parsed?.monthly),
+        lastUsedAt: typeof parsed?.lastUsedAt === "string" ? parsed.lastUsedAt : ""
       };
     } catch (error) {
       if (error?.code !== "ENOENT") this.data = emptyUsage();
@@ -70,7 +85,8 @@ export class UsageStore {
     this.data.monthly[month] = (this.data.monthly[month] ?? 0) + 1;
     this.data.lastUsedAt = at.toISOString();
     this.prune(at);
-    this.writeChain = this.writeChain.then(() => this.save()).catch(() => {});
+    this.writeChain = this.pendingSnapshot.then(() => this.save());
+    this.pendingSnapshot = this.writeChain.catch(() => {});
     await this.writeChain;
     return this.summary();
   }

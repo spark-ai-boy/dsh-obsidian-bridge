@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { watch } from "node:fs";
-import { mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { embedTexts, testEmbedding } from "./embeddings.js";
 import {
@@ -120,6 +121,15 @@ export class VaultIndex {
     this.writeManager = null;
     this.usage = null;
     this._initPromise = null;
+    this.abortController = new AbortController();
+    this.rebuildRequested = false;
+    this.indexWrites = Promise.resolve();
+    this.indexWriteBarriers = new Set();
+    this.saveSnapshotChain = Promise.resolve();
+    this.settingsTail = Promise.resolve();
+    this.embeddingGeneration = 0;
+    this.indexingErrors = [];
+    this.lastIndexError = "";
   }
 
   get vectorDimensions() {
@@ -138,6 +148,7 @@ export class VaultIndex {
   }
 
   async initialize({ force = false } = {}) {
+    this.assertActive();
     if (this._initPromise && !force) return this._initPromise;
     this._initPromise = this._initialize().catch((error) => {
       this._initPromise = null;
@@ -158,7 +169,7 @@ export class VaultIndex {
       vaultPath: this.config.vaultPath || "",
       indexMode: this.config.indexMode || "hybrid"
     };
-    for (const key of ["embeddingUrl", "embeddingModel", "embeddingDimensions", "embeddingApiKey", "autoApproveWrites", "watch", "excludedFolders", "maxChunkChars"]) {
+    for (const key of ["embeddingUrl", "embeddingModel", "embeddingDimensions", "embeddingApiKey", "embeddingBatchSize", "embeddingTimeoutMs", "embeddingMaxRetries", "embeddingRetryDelayMs", "autoApproveWrites", "watch", "excludedFolders", "maxChunkChars"]) {
       if (this.config[key] !== undefined) defaults[key] = this.config[key];
     }
     this.settingsStore = new SettingsStore({
@@ -171,7 +182,7 @@ export class VaultIndex {
       vaultPath: this.vaultPath,
       realVaultPath: this.realVaultPath,
       dataDir: this.dataDir,
-      persist: () => this.saveIndex().catch(() => {})
+      persist: () => this.saveIndex()
     });
     this.usage = new UsageStore({ dataDir: this.dataDir });
     await this.usage.ready;
@@ -195,15 +206,14 @@ export class VaultIndex {
       const loaded = await this.loadIndex();
       const changed = !loaded || await this.hasChanges();
       if (loaded && !changed) {
-        if (this.settings.indexMode !== "keyword") {
-          this.embeddingReady = this.chunks.length === 0 || this.embeddedCount() === this.chunks.length;
-          this.embeddingProgress = this.chunks.length
-            ? Math.round((this.embeddedCount() / this.chunks.length) * 100)
-            : 100;
-        }
         this.refreshStats();
         this.startWatching();
-        if (this.settings.indexMode !== "keyword" && !this.embeddingReady) void this.embedPending();
+        if (this.settings.indexMode !== "keyword" && !this.embeddingReady) this.embedPending().catch((error) => {
+          if (!this.disposed) {
+            this.recordIndexError("embedPending", error);
+            this.refreshStats();
+          }
+        });
         return this;
       }
       await this.rebuild({ embed: true });
@@ -215,6 +225,10 @@ export class VaultIndex {
       this.logger.warn?.(`[vault-studio] index initialization failed: ${this.initError}`);
       return this;
     }
+  }
+
+  assertActive() {
+    if (this.disposed) throw new Error("Vault service is shutting down.");
   }
 
   async assertVault() {
@@ -250,7 +264,8 @@ export class VaultIndex {
       let entries;
       try {
         entries = await readdir(directory, { withFileTypes: true });
-      } catch {
+      } catch (error) {
+        this.recordIndexError(toPosix(relative(this.vaultPath, directory) || "."), error);
         return;
       }
       for (const entry of entries) {
@@ -266,8 +281,8 @@ export class VaultIndex {
           if (info.size > 3_000_000) continue;
           const path = toPosix(relative(this.vaultPath, full));
           files[path] = { mtime: info.mtimeMs, size: info.size };
-        } catch {
-          // Skip unreadable files; the next rebuild can pick them up.
+        } catch (error) {
+          this.recordIndexError(toPosix(relative(this.vaultPath, full)), error);
         }
       }
     };
@@ -276,13 +291,18 @@ export class VaultIndex {
   }
 
   async rebuild({ embed = true } = {}) {
-    if (this.building) return this.ready;
+    if (this.building) {
+      this.rebuildRequested = true;
+      return this.ready;
+    }
     if (!this.vaultPath) {
       this.statsData = emptyStats(this.settings || this.config);
       return this;
     }
     this.building = true;
     this.buildProgress = 0;
+    this.indexingErrors = [];
+    this.lastIndexError = "";
     this.embeddingError = "";
     this.initError = "";
     this.ready = (async () => {
@@ -298,11 +318,15 @@ export class VaultIndex {
         const oldVectors = new Map();
         if (this.settings.indexMode !== "keyword" && this.vectors.length === this.chunks.length) {
           this.chunks.forEach((chunk, index) => {
-            if (this.hasVector(index)) oldVectors.set(chunk.id, this.vectors[index]);
+            // Key the cache by content hash, not chunk id: the id embeds the
+            // chunk's positional index, so inserting a line mid-note shifted
+            // every later id and invalidated vectors of unchanged chunks.
+            if (this.hasVector(index)) oldVectors.set(chunk.hash, this.vectors[index]);
           });
         }
 
         for (let index = 0; index < paths.length; index += 1) {
+          if (this.disposed || this.abortController.signal.aborted) return;
           const path = paths[index];
           const full = join(this.vaultPath, path);
           try {
@@ -321,7 +345,12 @@ export class VaultIndex {
             });
             chunks.push(...note.chunks);
           } catch (error) {
+            this.recordIndexError(path, error);
             this.logger.warn?.(`[vault-studio] failed to read ${path}: ${error instanceof Error ? error.message : String(error)}`);
+            // Only successfully parsed files are committed to the cache. An
+            // unchanged file with a transient read/parse failure must be
+            // retried on the next incremental scan rather than marked done.
+            delete files[path];
           }
           this.buildProgress = Math.round(((index + 1) / Math.max(1, paths.length)) * 100);
         }
@@ -329,12 +358,20 @@ export class VaultIndex {
         this.notes = notes;
         this.chunks = chunks;
         this.files = files;
-        this.vectors = chunks.map((chunk) => oldVectors.get(chunk.id));
-        this.vectorMask = chunks.map((chunk) => oldVectors.has(chunk.id));
+        this.vectors = chunks.map((chunk) => oldVectors.get(chunk.hash));
+        this.vectorMask = chunks.map((chunk) => oldVectors.has(chunk.hash));
         this.buildPostings();
+        if (this.disposed || this.abortController.signal.aborted) return;
         this.settings.lastIndexedAt = new Date().toISOString();
-        await this.settingsStore.update({ lastIndexedAt: this.settings.lastIndexedAt });
-        await this.saveIndex();
+        await this.settingsStore.update({ lastIndexedAt: this.settings.lastIndexedAt }).catch((error) => {
+          this.recordIndexError("settings", error);
+        });
+        if (this.disposed || this.abortController.signal.aborted) return;
+        await this.saveIndex().catch((error) => {
+          // In-memory results are usable, but a failed snapshot is a visible
+          // indexing error and the next write/scan gets a chance to retry.
+          if (!this.disposed) this.recordIndexError("index.json", error);
+        });
         this.embeddingReady =
           chunks.length === 0 ||
           this.settings.indexMode === "keyword" ||
@@ -346,18 +383,37 @@ export class VaultIndex {
       } finally {
         this.building = false;
       }
+      if (this.disposed) return this;
       if (embed && this.settings.indexMode !== "keyword") {
-        // Return the keyword index immediately; embedding progress is observable
-        // through indexStatus and the UI polls it.
-        void this.embedPending();
+        // A rebuild may join a run that was already embedding the same vault
+        // snapshot (including an updateSettings rebuild). Share that run rather
+        // than clearing its progress and starting a duplicate request chain,
+        // especially when the configured endpoint is unavailable.
+        if (!this.embeddingTask) {
+          this.embedPending().catch((error) => {
+            if (!this.disposed) {
+              this.recordIndexError("embedPending", error);
+              this.refreshStats();
+            }
+          });
+        }
       }
       return this;
     })();
+    this.trackIndexWrite(this.ready);
     try {
       await this.ready;
     } finally {
       this.ready = null;
     }
+    // A write or filesystem change arrived during the previous scan. Do not
+    // discard it behind a completed stale snapshot. Each waiter receives that
+    // follow-up rescan when it occurs during its own await.
+    if (this.rebuildRequested && !this.disposed) {
+      this.rebuildRequested = false;
+      return this.rebuild({ embed });
+    }
+    this.rebuildRequested = false;
     return this;
   }
 
@@ -380,8 +436,52 @@ export class VaultIndex {
     this.vocabulary = [...this.postings.keys()];
   }
 
+  /**
+   * Embed one batch with a retry, then bisect on persistent failure so a
+   * single rejected text (gateway content filters drop the connection for
+   * patterns like `$ curl ...` or `prompt (...)` inside technical notes)
+   * cannot abort the whole embedding run. Rejected texts resolve to `null`
+   * and stay unvectorized; everything else is embedded normally.
+   */
+  async embedBatchWithIsolation(batch) {
+    const texts = () => batch.map((item) => item.chunk.searchText || item.chunk.text);
+    let lastError = null;
+    const maxRetries = Math.max(1, Math.min(11, (Number(this.settings.embeddingMaxRetries) ?? 3) + 1));
+    const retryDelay = Math.max(0, Math.min(60_000, Number(this.settings.embeddingRetryDelayMs) ?? 250));
+    for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+      try {
+        return await embedTexts(this.settings, texts(), this.abortController.signal);
+      } catch (error) {
+        lastError = error;
+        if (this.disposed || this.abortController.signal.aborted) throw error;
+        if (attempt < maxRetries && retryDelay) {
+          await new Promise((resolve, reject) => {
+            const timer = setTimeout(resolve, retryDelay * attempt);
+            this.abortController.signal.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(this.abortController.signal.reason || new Error("Embedding run was cancelled."));
+            }, { once: true });
+          });
+        }
+      }
+    }
+    if (batch.length === 1) {
+      this.logger?.warn?.(
+        `[vault-studio] embedding service keeps rejecting chunk ${batch[0].chunk.id} (${batch[0].chunk.notePath}); skipping it`
+      );
+      return [null];
+    }
+    const mid = Math.ceil(batch.length / 2);
+    const halves = [batch.slice(0, mid), batch.slice(mid)];
+    const vectors = [];
+    for (const half of halves) {
+      vectors.push(...(await this.embedBatchWithIsolation(half)));
+    }
+    return vectors;
+  }
+
   async embedPending() {
-    if (this.disposed) return [];
+    if (this.disposed || this.abortController.signal.aborted) return [];
     if (this.embeddingTask) return this.embeddingTask;
     if (!this.settings || this.settings.indexMode === "keyword") return [];
     if (!this.settings.embeddingUrl) {
@@ -389,29 +489,37 @@ export class VaultIndex {
       this.refreshStats();
       return [];
     }
-    this.embeddingTask = (async () => {
+    this.embeddingTask = this.trackIndexWrite((async () => {
+      let skipped = 0;
       try {
         const pending = [];
         this.chunks.forEach((chunk, index) => {
           if (!this.hasVector(index)) pending.push({ chunk, index });
         });
         if (!pending.length) {
-          this.embeddingReady = true;
-          this.embeddingProgress = 100;
-          this.embeddingError = "";
+          this.embeddingReady = this.chunks.length === 0 || this.embeddedCount() === this.chunks.length;
+          this.embeddingProgress = this.chunks.length
+            ? Math.round((this.embeddedCount() / this.chunks.length) * 100)
+            : 100;
           this.refreshStats();
           return;
         }
         this.embeddingReady = false;
         this.embeddingError = "";
-        for (let index = 0; index < pending.length; index += 24) {
-          const batch = pending.slice(index, index + 24);
-          const vectors = await embedTexts(
-            this.settings,
-            batch.map((item) => item.chunk.searchText || item.chunk.text)
-          );
+        const batchSize = Math.max(1, Math.min(128, Number(this.settings.embeddingBatchSize) || 24));
+        for (let index = 0; index < pending.length; index += batchSize) {
+          if (this.disposed || this.abortController.signal.aborted) return;
+          const batch = pending.slice(index, index + batchSize);
+          const vectors = await this.embedBatchWithIsolation(batch);
           for (let offset = 0; offset < batch.length; offset += 1) {
             const vector = vectors[offset];
+            if (vector === null) {
+              // The embedding service permanently rejected this text (e.g. a
+              // gateway-side content filter). Leave it unvectorized instead of
+              // aborting the whole embedding run.
+              skipped += 1;
+              continue;
+            }
             if (!Array.isArray(vector) || !vector.length) throw new Error("Embedding service returned an empty vector.");
             if (
               this.settings.embeddingDimensions > 0 &&
@@ -421,28 +529,55 @@ export class VaultIndex {
                 `Embedding dimension mismatch: configured ${this.settings.embeddingDimensions}, received ${vector.length}.`
               );
             }
+            if (this.disposed || this.abortController.signal.aborted) return;
             this.vectors[batch[offset].index] = Float32Array.from(vector);
             this.vectorMask[batch[offset].index] = true;
           }
-          this.embeddingProgress = Math.round(((index + batch.length) / pending.length) * 100);
+          this.embeddingProgress = this.chunks.length
+            ? Math.round((this.embeddedCount() / this.chunks.length) * 100)
+            : 100;
           if (this.disposed) return;
-          if (index === 0 || index % (24 * 8) === 0 || index + batch.length >= pending.length) {
+          if (index === 0 || (index / batchSize) % 8 === 0 || index + batch.length >= pending.length) {
             await this.saveIndex();
           }
         }
-        this.embeddingReady = true;
-        this.embeddingProgress = 100;
+        this.embeddingReady = this.chunks.length === 0 || this.embeddedCount() === this.chunks.length;
+        this.embeddingProgress = this.chunks.length
+          ? Math.round((this.embeddedCount() / this.chunks.length) * 100)
+          : 100;
+        if (skipped) {
+          this.embeddingError = `${skipped} chunk${skipped === 1 ? "" : "s"} could not be embedded and remain searchable by keywords only.`;
+        }
         this.refreshStats();
         await this.saveIndex();
       } catch (error) {
+        if (this.disposed || this.abortController.signal.aborted) return;
         this.embeddingError = error instanceof Error ? error.message : String(error);
         this.embeddingReady = false;
         this.refreshStats();
       } finally {
         this.embeddingTask = null;
       }
-    })();
+    })());
     return this.embeddingTask;
+  }
+
+  async settleBackgroundIndex() {
+    let rebuild = this.rebuildTask || this.ready;
+    if (rebuild) await rebuild.catch(() => {});
+    let embedding = this.embeddingTask;
+    while (embedding) {
+      await embedding.catch(() => {});
+      await this.indexWrites;
+      if (this.building) {
+        const followUp = this.ready;
+        if (followUp) await followUp.catch(() => {});
+      }
+      embedding = this.embeddingTask;
+    }
+    await this.indexWrites;
+    const status = this.status();
+    return status.indexingError || this.embeddingError || "";
   }
 
   refreshStats() {
@@ -562,7 +697,7 @@ export class VaultIndex {
       lastIndexedAt: this.settings?.lastIndexedAt ?? "",
       indexMode: this.settings?.indexMode ?? "hybrid",
       usage: this.usage?.summary() ?? emptyUsage(),
-      error: this.initError || this.embeddingError || "",
+      error: this.initError || this.embeddingError || this.lastIndexError || "",
       embedding: {
         enabled: (this.settings?.indexMode ?? "hybrid") !== "keyword",
         ready: this.embeddingReady,
@@ -579,6 +714,14 @@ export class VaultIndex {
     return this.statsData;
   }
 
+  recordIndexError(operation, error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const entry = { path: String(operation), error: message };
+    this.indexingErrors = [...this.indexingErrors.filter((item) => item.path !== entry.path), entry].slice(-100);
+    this.lastIndexError = `${entry.path}: ${entry.error}`;
+    return entry;
+  }
+
   async recordUsage(tool) {
     if (!this.usage) return;
     await this.usage.record(tool);
@@ -590,14 +733,26 @@ export class VaultIndex {
   }
 
   status() {
+    let firstPendingChunk = null;
+    if (this.settings.indexMode !== "keyword") {
+      const index = this.chunks.findIndex((_chunk, position) => !this.hasVector(position));
+      if (index >= 0) {
+        const chunk = this.chunks[index];
+        firstPendingChunk = { id: chunk.id, notePath: chunk.notePath };
+      }
+    }
     return {
       building: this.building,
       buildProgress: this.buildProgress,
       embeddingReady: this.embeddingReady,
       embeddingProgress: this.embeddingProgress,
       embeddingError: this.embeddingError,
+      indexingError: this.lastIndexError,
+      indexingErrors: this.indexingErrors.map((entry) => ({ ...entry })),
       chunks: this.chunks.length,
-      vectors: this.embeddedCount()
+      vectors: this.embeddedCount(),
+      pending: Math.max(0, this.chunks.length - this.embeddedCount()),
+      firstPendingChunk
     };
   }
 
@@ -664,17 +819,24 @@ export class VaultIndex {
   }
 
   async queryVector(query, signal) {
+    const generation = this.embeddingGeneration;
+    const settings = this.settings;
     const cached = this.queryCache.get(query);
     if (cached) return cached;
-    if (!this.settings.embeddingUrl) return null;
+    if (!settings.embeddingUrl) return null;
     try {
-      const [vector] = await embedTexts(this.settings, [query], signal);
+      const [vector] = await embedTexts(settings, [query], signal);
+      if (generation !== this.embeddingGeneration) return this.queryVector(query, signal);
       const typed = Float32Array.from(vector);
       this.queryCache.set(query, typed);
       while (this.queryCache.size > 50) this.queryCache.delete(this.queryCache.keys().next().value);
       this.embeddingError = "";
       return typed;
     } catch (error) {
+      if (generation !== this.embeddingGeneration) return this.queryVector(query, signal);
+      if (signal?.aborted || this.disposed || this.abortController.signal.aborted) {
+        throw signal?.reason || this.abortController.signal.reason || error;
+      }
       this.embeddingError = error instanceof Error ? error.message : String(error);
       return null;
     }
@@ -709,7 +871,10 @@ export class VaultIndex {
   }
 
   async search({ query = "", mode, limit = DEFAULT_LIMIT, folders = [], tags = [] } = {}, signal) {
+    this.assertActive();
     await this.initialize();
+    this.assertActive();
+    signal?.throwIfAborted();
     const selectedMode = ["hybrid", "semantic", "keyword"].includes(mode)
       ? mode
       : this.settings.indexMode;
@@ -724,19 +889,27 @@ export class VaultIndex {
     let semantic = [];
     let queryVector = null;
 
+    signal?.throwIfAborted();
     if (queryText) {
       const keywordCandidates = this.keywordScores(queryText, allowed);
       keyword = selectedMode === "semantic" ? [] : keywordCandidates;
       if (selectedMode !== "keyword") {
         queryVector = await this.queryVector(queryText, signal);
-        if (queryVector) {
-          semantic = this.semanticScores(queryVector, allowed);
-        } else {
-          warning.push(this.embeddingError || "Semantic search is unavailable; showing keyword results.");
-        }
-        if (selectedMode === "semantic" && !semantic.length) {
-          warning.push("No semantic vectors are available yet; showing keyword results.");
+        if (!queryVector && selectedMode === "hybrid") {
           keyword = keywordCandidates;
+          warning.push(`Semantic component unavailable; keyword-only results. ${this.embeddingError || ""}`.trim());
+        } else if (queryVector) {
+          semantic = this.semanticScores(queryVector, allowed);
+          if (selectedMode === "hybrid" && !semantic.length) {
+            keyword = keywordCandidates;
+            warning.push("No matching semantic vectors; keyword results are shown.");
+          }
+        }
+        // An explicitly semantic request never silently switches to keyword:
+        // during indexing or transport failure, return no results and explain
+        // why instead of presenting keyword hits as semantic matches.
+        if (!queryVector && selectedMode === "semantic") {
+          warning.push(`Semantic search unavailable. ${this.embeddingError || "Embeddings are still indexing; try again later."}`.trim());
         }
       }
     } else {
@@ -789,7 +962,9 @@ export class VaultIndex {
     };
   }
 
-  listNotes({ query = "", folder = "", limit = 50 } = {}) {
+  async listNotes({ query = "", folder = "", limit = 50 } = {}) {
+    await this.initialize();
+    this.assertActive();
     const text = String(query).trim().toLowerCase();
     return [...this.notes]
       .filter((note) => (!folder || note.folder === folder) && (!text || `${note.title} ${note.path} ${note.tags.join(" ")}`.toLowerCase().includes(text)))
@@ -807,19 +982,22 @@ export class VaultIndex {
   }
 
   async readNote(notePath, signal) {
+    await this.initialize();
+    this.assertActive();
     if (!this.vaultPath) throw new Error("Vault path is not configured.");
     const normalized = toPosix(String(notePath ?? "")).replace(/^\/+/, "");
     const full = resolve(this.vaultPath, normalized);
     if (!isInside(this.vaultPath, full) || !/\.md$/i.test(full)) {
       throw new Error("Note path must point inside the vault and end with .md.");
     }
-    if (signal?.aborted) throw new Error("Read cancelled.");
-    const canonical = await realpath(full).catch(() => full);
+    signal?.throwIfAborted();
+    const canonical = await realpath(full);
     if (!isInside(this.realVaultPath || this.vaultPath, canonical)) {
       throw new Error("Note path resolves outside the configured vault.");
     }
     const info = await stat(full);
     if (info.size > 3_000_000) throw new Error("Note is larger than the 3 MB indexing limit.");
+    signal?.throwIfAborted();
     const raw = await readFile(full, "utf8");
     const note = parseNote({
       path: toPosix(relative(this.vaultPath, full)),
@@ -850,10 +1028,16 @@ export class VaultIndex {
   }
 
   async applyWrite(proposalId) {
+    this.assertActive();
+    await this.initialize();
+    this.assertActive();
     return this.writeManager.apply(proposalId);
   }
 
   async undoWrite(undoId) {
+    this.assertActive();
+    await this.initialize();
+    this.assertActive();
     return this.writeManager.undo(undoId);
   }
 
@@ -871,17 +1055,35 @@ export class VaultIndex {
 
   async getSettings() {
     await this.initialize();
-    return { ...this.settings };
+    return this.settingsStore.publicSettings;
   }
 
   async updateSettings(patch = {}) {
+    const operation = this.settingsTail.then(() => this.commitSettings(patch));
+    this.settingsTail = operation.catch(() => {});
+    return operation;
+  }
+
+  async commitSettings(patch) {
     await this.initialize();
+    this.assertActive();
     const before = { ...this.settings };
     const next = await this.settingsStore.update(patch);
     this.settings = next;
+    if (["embeddingUrl", "embeddingModel", "embeddingDimensions", "embeddingApiKey"].some(
+      (key) => before[key] !== next[key]
+    )) this.embeddingGeneration += 1;
     this.queryCache.clear();
     this.vaultPath = next.vaultPath ? resolve(next.vaultPath) : "";
+    this.realVaultPath = "";
     this.writeManager?.setVaultPath(this.vaultPath, this.realVaultPath);
+    const meaningfulKeys = new Set([
+      "vaultPath", "watch", "indexMode", "embeddingUrl", "embeddingModel",
+      "embeddingDimensions", "embeddingApiKey", "embeddingBatchSize",
+      "embeddingTimeoutMs", "embeddingMaxRetries", "embeddingRetryDelayMs",
+      "excludedFolders", "maxChunkChars"
+    ]);
+    const hasChanges = Object.keys(next).some((key) => meaningfulKeys.has(key) && before[key] !== next[key]);
     const needsRebuild =
       before.vaultPath !== next.vaultPath ||
       before.indexMode !== next.indexMode ||
@@ -890,9 +1092,16 @@ export class VaultIndex {
       before.embeddingDimensions !== next.embeddingDimensions ||
       before.excludedFolders !== next.excludedFolders ||
       before.maxChunkChars !== next.maxChunkChars;
-    if (before.vaultPath !== next.vaultPath || before.watch !== next.watch) {
-      await this.startWatching();
+    if (!hasChanges) return this.settingsStore.publicSettings;
+    if (!this.vaultPath || before.vaultPath !== next.vaultPath) {
+      this.notes = [];
+      this.chunks = [];
+      this.vectors = [];
+      this.vectorMask = [];
+      this.files = {};
+      this.statsData = emptyStats(next);
     }
+    if (before.vaultPath !== next.vaultPath || before.watch !== next.watch) this.startWatching();
     if (needsRebuild) {
       // Saving settings must return immediately. Clearing the vector store and
       // re-embedding can take minutes; the UI observes progress through
@@ -900,37 +1109,56 @@ export class VaultIndex {
       const previousEmbedding = this.embeddingTask;
       this.embeddingReady = false;
       this.embeddingProgress = 0;
-      const task = (this.rebuildTask ?? Promise.resolve())
-        .then(async () => {
-          if (previousEmbedding) await previousEmbedding.catch(() => {});
-          if (this.disposed) return;
-          this.vectors = [];
-          this.vectorMask = [];
-          await this.startWatching();
+      // Publish the task synchronously. Starting in an async continuation
+      // creates a window where the next update also sees rebuildTask=null.
+      // Capture predecessors synchronously, before awaiting the embedding task;
+      // a later update may already own the shared rebuildTask by then.
+      const previousRebuild = this.rebuildTask;
+      const task = (async () => {
+        if (previousEmbedding) await previousEmbedding.catch(() => {});
+        if (previousRebuild) await previousRebuild.catch(() => {});
+        if (this.disposed) return;
+        this.vectors = [];
+        this.vectorMask = [];
+        await this.startWatching();
+        await this.rebuild({ embed: true });
+        // A different update may have waited for this task and queued a
+        // follow-up before this code clears its handle. Do not clear that
+        // newer task or lose its required rescan.
+        if (this.rebuildRequested && !this.disposed && !this.building) {
+          this.rebuildRequested = false;
           await this.rebuild({ embed: true });
-        })
-        .catch((error) => {
-          this.initError = error instanceof Error ? error.message : String(error);
-          this.statsData = emptyStats(this.settings, { error: this.initError });
-        });
+        }
+      })().catch((error) => {
+        this.initError = error instanceof Error ? error.message : String(error);
+        this.statsData = emptyStats(this.settings, { error: this.initError });
+      });
+      // Install synchronously before awaiting the legacy task: otherwise two
+      // immediate calls both see null and run independent complete scans.
       this.rebuildTask = task;
       task.finally(() => {
         if (this.rebuildTask === task) this.rebuildTask = null;
       });
     }
-    return { ...this.settings };
+    return this.settingsStore.publicSettings;
   }
 
-  async testEmbedding(settingsOverride) {
+  async testEmbedding(settingsOverride, signal) {
     await this.initialize();
-    const settings = { ...this.settings, ...(settingsOverride || {}) };
-    return testEmbedding(settings);
+    const { embeddingApiKey, ...override } = settingsOverride || {};
+    const settings = {
+      ...this.settings,
+      ...override,
+      embeddingApiKey: typeof embeddingApiKey === "string" && embeddingApiKey ? embeddingApiKey : this.settings.embeddingApiKey
+    };
+    return testEmbedding(settings, signal);
   }
 
   async reindex() {
     await this.initialize();
-    void this.rebuild({ embed: true }).catch((error) => {
-      this.embeddingError = error instanceof Error ? error.message : String(error);
+    this.rebuild({ embed: true }).catch((error) => {
+      this.recordIndexError("reindex", error);
+      this.refreshStats();
     });
     return { started: true };
   }
@@ -943,8 +1171,9 @@ export class VaultIndex {
         if (!filename || !/\.md$/i.test(String(filename))) return;
         clearTimeout(this.watchTimer);
         this.watchTimer = setTimeout(() => {
-          void this.rebuild({ embed: true }).catch((error) => {
-            this.embeddingError = error instanceof Error ? error.message : String(error);
+          this.rebuild({ embed: true }).catch((error) => {
+            this.recordIndexError("watch", error);
+            this.refreshStats();
           });
         }, 1800);
         this.watchTimer.unref?.();
@@ -965,13 +1194,39 @@ export class VaultIndex {
     this.watchTimer = null;
   }
 
-  async saveIndex() {
+  trackIndexWrite(promise) {
+    const tracked = Promise.resolve(promise);
+    this.indexWriteBarriers.add(tracked);
+    tracked.finally(() => this.indexWriteBarriers.delete(tracked)).catch(() => {});
+    return tracked;
+  }
+
+  queueIndexWrite(operation) {
+    const result = this.saveSnapshotChain.then(() => {
+      // An already-started write may finish atomically, but unload must never
+      // schedule a later trailing save behind the close barrier.
+      if (this.disposed) return;
+      return operation();
+    });
+    this.saveSnapshotChain = result.catch(() => {});
+    return this.trackIndexWrite(result);
+  }
+
+  saveIndex() {
+    return this.queueIndexWrite(() => this.saveIndexSnapshot());
+  }
+
+  async saveIndexSnapshot() {
     if (!this.dataDir) return;
-    await mkdir(this.dataDir, { recursive: true, mode: 0o700 });
-    const dimensions = this.vectors.find(
-      (vector, index) => this.hasVector(index) && vector instanceof Float32Array
-    )?.length ?? 0;
-    const embedded = this.embeddedCount();
+    // Capture chunks and vectors together into a private snapshot before any
+    // async I/O. A later rebuild cannot splice unrelated index/vector files.
+    const chunks = this.chunks.slice();
+    const vectorMask = this.vectorMask.slice();
+    const vectors = this.vectors.map((vector, index) => vectorMask[index] ? vector?.slice() : undefined);
+    const files = this.files;
+    const notes = this.notes;
+    const dimensions = vectors.find((vector) => vector instanceof Float32Array)?.length ?? 0;
+    const embedded = vectorMask.reduce((count, value, i) => count + (value && vectors[i] instanceof Float32Array ? 1 : 0), 0);
     const index = {
       version: INDEX_VERSION,
       vaultPath: this.vaultPath,
@@ -982,20 +1237,35 @@ export class VaultIndex {
         excludedFolders: this.settings.excludedFolders,
         maxChunkChars: this.settings.maxChunkChars
       },
-      files: this.files ?? {},
-      notes: this.notes.map(({ chunks, body, ...note }) => note),
-      chunks: this.chunks,
-      vectorMask: this.vectorMask.map(Boolean),
+      files: files ?? {},
+      notes: notes.map(({ chunks, body, ...note }) => note),
+      chunks,
+      vectorMask: chunks.map((chunk, i) => Boolean(vectorMask[i] && vectors[i] instanceof Float32Array)),
       vectorCount: embedded,
       dimensions
     };
-    await writeFile(join(this.dataDir, "index.json"), JSON.stringify(index), { mode: 0o600 });
-    if (dimensions > 0 && this.chunks.length > 0) {
-      const buffer = Buffer.alloc(this.chunks.length * dimensions * 4);
+    // Write both files to a temp path first and rename over the target, so a
+    // crash mid-save cannot leave a truncated index.json (which loadIndex()
+    // treats as invalid and discards, triggering a full re-embed). index.json
+    // is committed last: it is the marker that the matching vectors.bin is
+    // complete.
+    // Snapshot the first file before yielding: a later rebuild may replace
+    // chunks of a different dimension before this file reaches rename().
+    const serialized = await this.serializeVectors(dimensions, chunks, vectors);
+    await this.writeAtomic(join(this.dataDir, "vectors.bin"), () => serialized);
+    if (this.disposed) return;
+    await this.writeAtomic(join(this.dataDir, "index.json"), () => JSON.stringify(index));
+  }
+
+  async serializeVectors(dimensions, chunks = this.chunks, vectors = this.vectors) {
+    if (dimensions > 0 && chunks.length > 0) {
+      const buffer = Buffer.alloc(chunks.length * dimensions * 4);
       let offset = 0;
-      for (let index = 0; index < this.chunks.length; index += 1) {
-        if (this.hasVector(index)) {
-          for (const value of this.vectors[index]) {
+      for (let index = 0; index < chunks.length; index += 1) {
+        const vector = vectors[index];
+        if (vector instanceof Float32Array) {
+          if (vector.length !== dimensions) throw new Error("Vector dimensions changed within one snapshot.");
+          for (const value of vector) {
             buffer.writeFloatLE(value, offset);
             offset += 4;
           }
@@ -1003,10 +1273,16 @@ export class VaultIndex {
           offset += dimensions * 4;
         }
       }
-      await writeFile(join(this.dataDir, "vectors.bin"), buffer, { mode: 0o600 });
-    } else {
-      await writeFile(join(this.dataDir, "vectors.bin"), Buffer.alloc(0), { mode: 0o600 });
+      return buffer;
     }
+    return Buffer.alloc(0);
+  }
+
+  async writeAtomic(targetPath, produce) {
+    const tmpPath = `${targetPath}.tmp-${randomUUID()}`;
+    const payload = await produce();
+    await writeFile(tmpPath, payload, { mode: 0o600 });
+    await rename(tmpPath, targetPath);
   }
 
   async loadIndex() {
@@ -1042,19 +1318,32 @@ export class VaultIndex {
       if (dimensions > 0 && Number(index.vectorCount) > 0) {
         try {
           const buffer = await readFile(join(this.dataDir, "vectors.bin"));
-          for (let indexOffset = 0; indexOffset < this.chunks.length; indexOffset += 1) {
-            if (!mask[indexOffset]) continue;
-            const start = indexOffset * dimensions * 4;
-            if (start + dimensions * 4 > buffer.length) break;
-            const vector = new Float32Array(dimensions);
-            for (let dimension = 0; dimension < dimensions; dimension += 1) {
-              vector[dimension] = buffer.readFloatLE(start + dimension * 4);
+          const expected = this.chunks.length * dimensions * 4;
+          if (buffer.length >= expected) {
+            // View the buffer directly: one Float32Array over the whole file
+            // (4-byte aligned by construction) instead of chunks.length ×
+            // dimensions readFloatLE calls — for 32k chunks at 4096 dims that
+            // is 131M function calls per session startup.
+            for (let indexOffset = 0; indexOffset < this.chunks.length; indexOffset += 1) {
+              if (!mask[indexOffset]) continue;
+              const start = indexOffset * dimensions * 4;
+              if (start + dimensions * 4 > buffer.length) break;
+              // The index/vector save protocol writes vectors.bin first and
+              // index.json last. If this buffer aliases an in-flight read or
+              // save, make a private copy to avoid a torn typed-array view.
+              const vector = new Float32Array(dimensions);
+              vector.set(new Float32Array(buffer.buffer, buffer.byteOffset + start, dimensions));
+              this.vectors[indexOffset] = vector;
+              this.vectorMask[indexOffset] = true;
             }
-            this.vectors[indexOffset] = vector;
-            this.vectorMask[indexOffset] = true;
+            const loaded = this.vectors.filter((vector) => vector instanceof Float32Array).length;
+            if (loaded !== Number(index.vectorCount)) throw new Error("Persisted vector count does not match vectors.bin.");
+          } else {
+            throw new Error("vectors.bin is shorter than the index metadata.");
           }
         } catch {
           this.vectors = this.chunks.map(() => undefined);
+          this.vectorMask = this.chunks.map(() => false);
         }
       }
       this.vectorMask = this.vectors.map((vector) => vector instanceof Float32Array);
@@ -1070,9 +1359,34 @@ export class VaultIndex {
     }
   }
 
-  dispose() {
+  async dispose() {
+    if (this.disposePromise) return this.disposePromise;
     this.disposed = true;
+    this.abortController.abort(new Error("Vault service is shutting down."));
     this.stopWatching();
+    this.queryCache.clear();
+    this.disposePromise = (async () => {
+      const initial = this._initPromise?.catch(() => {});
+      await (initial || this.writeManager?.flush() || Promise.resolve());
+      // Collect the full dynamic task graph. A build or storage-save promise
+      // may finish and clear its earlier handle while close is waiting.
+      await Promise.allSettled([
+        this.ready,
+        this.rebuildTask,
+        this.embeddingTask,
+        ...this.indexWriteBarriers
+      ]);
+      while (this.rebuildTask || this.embeddingTask || this.indexWriteBarriers.size) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        await Promise.allSettled([
+          this.rebuildTask,
+          this.embeddingTask,
+          ...this.indexWriteBarriers
+        ]);
+      }
+      await this.writeManager?.flush().catch(() => {});
+    })();
+    return this.disposePromise;
   }
 }
 

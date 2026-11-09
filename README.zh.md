@@ -90,14 +90,14 @@ DeepSeek Harness 支持从 GitHub 仓库或 npm 包安装，二选一：
 | `obsidian_stats` | 读取索引、统计和工作区状态 |
 | `obsidian_propose_write` | 生成新建/追加提案，不直接写入 |
 | `obsidian_apply_write` | 在你确认后应用提案 |
-| `obsidian_undo_write` | 撤销本次会话中的写入 |
+| `obsidian_undo_write` | 撤销指定的已执行写入，支持重启后恢复 |
 | `obsidian_index_status` | 查看索引和向量化进度 |
 
 插件不提供删除、移动、重命名或覆盖笔记的工具。
 
 ## 隐私与安全
 
-- 索引、向量、设置、调用统计都在本机。插件不包含遥测，也不会上传 Vault。
+- 索引、向量、设置、调用统计都在本机。插件不包含遥测。**配置非本机 Embedding 服务时，用于向量化的 Markdown 片段会发送到该服务地址**，这可能包含笔记正文；如需正文完全不出本机，请使用回环地址（127.0.0.1 或 localhost）的嵌入服务或关键词检索。
 - **允许 Obsidian 内容参与会话**关闭时，所有 `obsidian_*` Agent 工具在执行前被拒绝；Vault Studio 自己的检索和浏览仍然可用。
 - 系统提示要求模型在 Obsidian 工具失败时报告错误，不得通过通用文件工具绕过 Vault Studio 或访问开关。
 - 访问开关只限制 `obsidian_*` 工具；如果你需要更严格的隔离，请同时检查 DeepSeek Harness 的 workspace/sandbox 权限，避免通用 `read`、`grep`、`bash` 直接访问 Vault 路径。

@@ -14,13 +14,37 @@ export function sha1(value) {
   return createHash("sha1").update(value).digest("hex");
 }
 
+function removeYamlComment(value) {
+  let quote = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (quote === "'") {
+      if (char === "'" && value[index + 1] === "'") index += 1;
+      else if (char === "'") quote = "";
+    } else if (quote === '"') {
+      if (char === "\\") index += 1;
+      else if (char === '"') quote = "";
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === "#" && (index === 0 || /\s/.test(value[index - 1]))) {
+      return value.slice(0, index).trimEnd();
+    }
+  }
+  return value;
+}
+
 function stripQuotes(value) {
-  const trimmed = value.trim();
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1);
+  const trimmed = removeYamlComment(value).trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      const decoded = JSON.parse(trimmed);
+      if (typeof decoded === "string") return decoded;
+    } catch {
+      // Keep the literal value for malformed YAML, rather than dropping metadata.
+    }
+  }
+  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1).replace(/''/g, "'");
   }
   return trimmed;
 }
@@ -28,10 +52,27 @@ function stripQuotes(value) {
 function parseInlineArray(value) {
   const body = value.slice(1, -1).trim();
   if (!body) return [];
-  return body
-    .split(",")
-    .map((item) => stripQuotes(item))
-    .filter(Boolean);
+  // A quoted comma is part of an Obsidian alias/tag, not a new list item.
+  const items = [];
+  let quote = "";
+  let start = 0;
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if (quote === "'") {
+      if (char === "'" && body[index + 1] === "'") index += 1;
+      else if (char === "'") quote = "";
+    } else if (quote === '"') {
+      if (char === "\\") index += 1;
+      else if (char === '"') quote = "";
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === ",") {
+      items.push(body.slice(start, index));
+      start = index + 1;
+    }
+  }
+  items.push(body.slice(start));
+  return items.map((item) => parseScalar(item));
 }
 
 function parseScalar(value) {
@@ -57,9 +98,12 @@ export function parseLiteYaml(source) {
       result[currentKey].push(parseScalar(item[1] ?? ""));
       continue;
     }
-    const pair = rawLine.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
-    if (!pair) continue;
-    const key = pair[1];
+    const pair = rawLine.match(/^([^\s:#][^:]*?)\s*:(?:\s+(.*)|[ \t]*)$/);
+    if (!pair) {
+      if (rawLine.trim() && !/^\s/.test(rawLine)) currentKey = null;
+      continue;
+    }
+      const key = pair[1];
     const value = pair[2] ?? "";
     currentKey = key;
     if (value === "") {
@@ -78,24 +122,24 @@ export function parseLiteYaml(source) {
 
 export function parseFrontmatter(raw) {
   const text = raw.replace(/^\uFEFF/, "");
-  if (!text.startsWith("---")) {
-    return { frontmatter: {}, body: text, yaml: "" };
-  }
+  const withoutFrontmatter = (body) => ({ frontmatter: {}, body, yaml: "", bodyLineOffset: 0 });
+  if (!text.startsWith("---")) return withoutFrontmatter(text);
   const open = text.match(/^---[ \t]*\r?\n/);
-  if (!open) return { frontmatter: {}, body: text, yaml: "" };
+  if (!open) return withoutFrontmatter(text);
   const rest = text.slice(open[0].length);
   const close = /(^|\r?\n)---[ \t]*(?:\r?\n|$)/.exec(rest);
-  if (!close || close.index === undefined) {
-    return { frontmatter: {}, body: text, yaml: "" };
-  }
+  if (!close) return withoutFrontmatter(text);
   const yaml = rest.slice(0, close.index);
   const bodyStart = close.index + close[0].length;
-  return { frontmatter: parseLiteYaml(yaml), body: rest.slice(bodyStart), yaml };
+  // Returned heading/chunk ranges must reference the actual Markdown file,
+  // not a body with its YAML header removed.
+  const bodyLineOffset = text.slice(0, open[0].length + bodyStart).split(/\r?\n/).length - 1;
+  return { frontmatter: parseLiteYaml(yaml), body: rest.slice(bodyStart), yaml, bodyLineOffset };
 }
 
 export function asStringArray(value) {
   if (Array.isArray(value)) {
-    return value
+    return value.flat(Infinity)
       .map((item) => (typeof item === "string" ? item.trim() : ""))
       .filter(Boolean);
   }
@@ -147,7 +191,9 @@ function cleanTitle(value) {
   return value
     .replace(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, "$2$1")
     .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, "$2$1")
-    .replace(/[*_`~]/g, "")
+    .replace(/\*\*([^*]+)\*\*|__([^_]+)__/g, "$1$2")
+    .replace(/(^|\s)[*_~]([^*_~\s]+)[*_~](?=\s|$)/g, "$1$2")
+    .replace(/`([^`]+)`/g, "$1")
     .replace(/<[^>]+>/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -159,79 +205,58 @@ export function countWords(text) {
   return cjk + latin;
 }
 
-function splitLongSection(section, maxChars) {
-  if (section.text.length <= maxChars) return [section];
-  const paragraphs = section.text.split(/\n{2,}/);
-  const chunks = [];
-  let current = "";
-  let startLine = section.startLine;
-  let lineCursor = section.startLine;
-  for (const paragraph of paragraphs) {
-    const candidate = current ? `${current}\n\n${paragraph}` : paragraph;
-    if (candidate.length > maxChars && current) {
-      chunks.push({ ...section, text: current, startLine, endLine: lineCursor });
-      const overlap = current.slice(-Math.min(220, Math.floor(maxChars * 0.12)));
-      current = `${overlap}\n\n${paragraph}`;
-      startLine = Math.max(section.startLine, lineCursor - 2);
-    } else {
-      current = candidate;
-    }
-    lineCursor += paragraph.split(/\r?\n/).length + 1;
-  }
-  if (current.trim()) {
-    chunks.push({ ...section, text: current, startLine, endLine: lineCursor });
-  }
-  return chunks.length ? chunks : [section];
-}
+
 
 export function parseNote({ path, raw, mtime, size, maxChunkChars = 2200 }) {
-  const { frontmatter, body } = parseFrontmatter(raw);
-  const lines = body.split(/\r?\n/);
+  const { frontmatter, body, bodyLineOffset } = parseFrontmatter(raw);
+  const lines = raw.split(/\r?\n/).slice(bodyLineOffset);
   const headings = [];
   const sections = [];
   let stack = [];
-  let current = {
-    headingPath: [],
-    lines: [],
-    startLine: 1
-  };
-  let inFence = false;
-
-  const flush = (endLine) => {
-    const text = current.lines.join("\n").trim();
-    if (text) {
+  const bodyStart = bodyLineOffset + 1;
+  let current = { headingPath: [], lines: [], startLine: bodyStart };
+  let fenceMarker = null;
+  const flush = () => {
+    const first = current.lines.findIndex((line) => line.trim());
+    if (first >= 0) {
+      const last = current.lines.findLastIndex((line) => line.trim());
       sections.push({
         headingPath: current.headingPath,
-        text,
-        startLine: current.startLine,
-        endLine
+        text: current.lines.slice(first, last + 1).join("\n"),
+        startLine: current.startLine + first,
+        endLine: current.startLine + last
       });
     }
-    current = { headingPath: [...current.headingPath], lines: [], startLine: endLine + 1 };
+    current.lines = [];
   };
 
   lines.forEach((line, index) => {
-    const lineNumber = index + 1;
-    if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
-    const heading = !inFence ? line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/) : null;
+    const lineNumber = bodyLineOffset + index + 1;
+    if (fenceMarker) {
+      if (new RegExp(`^\\s{0,3}${fenceMarker}`).test(line)) fenceMarker = null;
+      current.lines.push(line);
+      return;
+    }
+    if (/^\s{0,3}(`{3,}|~{3,})/.test(line)) {
+      fenceMarker = line.match(/^\s{0,3}(`{3,}|~{3,})/)[1];
+      current.lines.push(line);
+      return;
+    }
+    const heading = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
     if (!heading) {
       current.lines.push(line);
       return;
     }
-
-    flush(lineNumber - 1);
+    flush();
     const level = heading[1].length;
     const title = headingTitle(line);
     headings.push({ level, title, line: lineNumber });
     stack = stack.filter((item) => item.level < level);
     stack.push({ level, title });
-    current = {
-      headingPath: stack.map((item) => item.title),
-      lines: [],
-      startLine: lineNumber + 1
-    };
+    current = { headingPath: stack.map((item) => item.title), lines: [], startLine: lineNumber + 1 };
   });
-  flush(lines.length);
+  current.startLine = bodyLineOffset + lines.length - current.lines.length + 1;
+  flush();
 
   const titleFromH1 = headings.find((heading) => heading.level === 1)?.title;
   const title =
@@ -243,12 +268,41 @@ export function parseNote({ path, raw, mtime, size, maxChunkChars = 2200 }) {
   const noteHash = sha1(raw);
   const chunks = [];
 
+
+  const splitLongSection = (section, cap) => {
+    // Empty lines are normalized by flush between headings (keeps all
+    // separators join("\n")-encoded below), so length is computed once.
+    const text = section.text;
+    if (text.length <= cap) return [section];
+    const parts = [];
+    let rest = text;
+    let sourceStart = section.startLine;
+    while (rest.length > cap) {
+      // Prefer a natural line break, but gracefully hard-split a single long
+      // paragraph/table. Newlines count toward maxChunkChars.
+      let end = rest.lastIndexOf("\n", cap - 1) + 1;
+      if (end <= 0) end = cap;
+      const used = rest.slice(0, end);
+      const sourceEnd = sourceStart + used.split("\n").length - 1;
+      parts.push({ headingPath: section.headingPath, text: used.trim(), startLine: sourceStart, endLine: sourceEnd });
+      sourceStart = sourceEnd + (used.endsWith("\n") ? 1 : 0);
+      rest = rest.slice(end).replace(/^\s+/, "");
+    }
+    if (rest) parts.push({ headingPath: section.headingPath, text: rest, startLine: sourceStart, endLine: section.endLine });
+    return parts;
+  };
+
   for (const section of sections) {
     for (const part of splitLongSection(section, Math.max(400, Number(maxChunkChars) || 2200))) {
       const headingPath = part.headingPath ?? [];
       const searchText = [title, path, ...headingPath, ...tags, part.text].join("\n");
       const chunkHash = sha1(searchText);
       chunks.push({
+        // Content-addressed id: stable across position shifts so a mid-note
+        // edit keeps the vector cache valid for every unchanged chunk. The
+        // leading ordinal only disambiguates two identical sections within
+        // the same note and never keys the vector cache (rebuild() matches
+        // on `hash`).
         id: `${path}#${chunks.length}-${chunkHash.slice(0, 8)}`,
         notePath: path,
         title,

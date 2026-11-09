@@ -163,13 +163,13 @@ window.__ModuleLoader__.load({
         "settings.watch": "Watch for file changes",
         "settings.autoWrite": "Allow automatic writes (not recommended)",
         "settings.autoWriteHint": "When off, every write requires confirmation.",
-        "settings.privacy": "Vault content and embeddings stay local. Only retrieved snippets are sent to the model when you or the agent include them.",
+        "settings.privacy": "Index, vectors, and settings stay local. A remote embedding service receives Markdown chunks for vectorization; use a loopback endpoint to keep note text on this machine.",
         "settings.testOk": "Embedding connected · {{dims}} dimensions",
         "settings.saved": "Settings saved.",
         "settings.embeddingFailed": "Embedding test failed: {{error}}",
         "settings.reindexStarted": "Reindex started.",
         "setup.title": "Connect your Obsidian vault",
-        "setup.body": "Point Vault Studio at a local vault. The index is built on this machine; nothing is uploaded.",
+        "setup.body": "Point Vault Studio at a local vault. Keyword indexing stays on this machine. Embedding can be configured separately later.",
         "setup.path": "Vault path",
         "setup.button": "Connect vault",
         "write.title": "Proposed write",
@@ -199,6 +199,9 @@ window.__ModuleLoader__.load({
         "settings.embeddingHint": "OpenAI-compatible or Ollama embedding endpoint",
         "settings.dimensionsHint": "Must match the model output",
         "settings.optional": "optional",
+        "settings.embeddingKeySaved": "Saved securely. Leave blank to keep the current key; enter a new key to replace it.",
+        "settings.embeddingKeyEmpty": "Optional. Leave blank for no API key.",
+        "layout.main": "Vault Studio",
         "search.resultsCount": "{{count}} results",
         "index.title": "Index status",
         "index.building": "Building",
@@ -366,13 +369,13 @@ window.__ModuleLoader__.load({
         "settings.watch": "监听文件变化",
         "settings.autoWrite": "允许自动写入（不推荐）",
         "settings.autoWriteHint": "关闭时，每次写入都需要用户确认。",
-        "settings.privacy": "笔记与向量索引留在本机。只有当用户或 Agent 明确把检索片段加入上下文时，片段才会发送给模型。",
+        "settings.privacy": "索引、向量和设置留在本机。非本机 Embedding 服务会收到待向量化的 Markdown 片段；如需正文不出本机，请使用回环地址或关键词检索。",
         "settings.testOk": "向量服务连接成功 · {{dims}} 维",
         "settings.saved": "设置已保存。",
         "settings.embeddingFailed": "向量服务测试失败：{{error}}",
         "settings.reindexStarted": "已开始重建索引。",
         "setup.title": "连接你的 Obsidian 知识库",
-        "setup.body": "把 Vault Studio 指向本地知识库。索引在本机构建，不会上传笔记。",
+        "setup.body": "把 Vault Studio 指向本地知识库。关键词索引在本机构建；远程向量服务可稍后单独配置。",
         "setup.path": "知识库路径",
         "setup.button": "连接知识库",
         "write.title": "写入提案",
@@ -402,6 +405,9 @@ window.__ModuleLoader__.load({
         "settings.embeddingHint": "OpenAI 兼容或 Ollama 向量端点",
         "settings.dimensionsHint": "必须与模型输出一致",
         "settings.optional": "可选",
+        "settings.embeddingKeySaved": "密钥已保存在本地。留空表示保持现有密钥，填写新值则替换。",
+        "settings.embeddingKeyEmpty": "可选，留空表示不使用 API 密钥。",
+        "layout.main": "Vault Studio 知识库",
         "search.resultsCount": "{{count}} 条结果",
         "index.title": "索引状态",
         "index.building": "构建",
@@ -1009,7 +1015,7 @@ window.__ModuleLoader__.load({
         if (!path.trim()) return;
         setBusy(true);
         try {
-          await api.call("updateSettings", { ...(settings || {}), vaultPath: path.trim() });
+          await api.call("updateSettings", { vaultPath: path.trim() });
           notify(t("settings.saved"));
           await onDone();
         } catch (error) {
@@ -1408,6 +1414,7 @@ window.__ModuleLoader__.load({
       const performSearch = async (notifyWarning = true) => {
         const text = query.trim();
         if (!text) {
+          searchSequence.current += 1;
           setResults([]);
           setMeta(null);
           setBusy(false);
@@ -1437,8 +1444,10 @@ window.__ModuleLoader__.load({
         if (event) event.preventDefault();
         void performSearch(true);
       };
+      useEffect(() => { setQuery(initialQuery || ""); }, [initialQuery]);
       useEffect(() => {
         if (!query.trim()) {
+          searchSequence.current += 1;
           setResults([]);
           setMeta(null);
           setBusy(false);
@@ -1446,7 +1455,7 @@ window.__ModuleLoader__.load({
         }
         const timer = setTimeout(() => { void performSearch(false); }, 240);
         return () => clearTimeout(timer);
-      }, [query, folder, tag]);
+      }, [query, folder, tag, mode, initialQuery]);
       const toggle = (result) => {
         setSelected((current) => current.some((item) => item.id === result.id)
           ? current.filter((item) => item.id !== result.id)
@@ -1536,6 +1545,7 @@ window.__ModuleLoader__.load({
       const [writeDraft, setWriteDraft] = useState(null);
       const [busy, setBusy] = useState(false);
       const openRequested = useRef("");
+      const noteSequence = useRef(0);
 
       const loadNotes = async () => {
         try {
@@ -1551,15 +1561,17 @@ window.__ModuleLoader__.load({
 
       const openNote = async (path) => {
         if (!path) return;
+        const sequence = ++noteSequence.current;
         setBusy(true);
         try {
           const note = await api.call("readNote", path);
+          if (sequence !== noteSequence.current) return;
           setActive(note);
           openRequested.current = path;
         } catch (error) {
-          onNotice(`${t("error.prefix")}${error.message}`, true);
+          if (sequence === noteSequence.current) onNotice(`${t("error.prefix")}${error.message}`, true);
         } finally {
-          setBusy(false);
+          if (sequence === noteSequence.current) setBusy(false);
         }
       };
 
@@ -1712,7 +1724,7 @@ window.__ModuleLoader__.load({
       const [testState, setTestState] = useState("idle");
       const [reindexState, setReindexState] = useState("idle");
 
-      useEffect(() => { setDraft(settings || {}); }, [settings]);
+      useEffect(() => { if (!busy) setDraft(settings || {}); }, [settings, busy]);
       useEffect(() => {
         void api.call("indexStatus").then(setStatus).catch(() => {});
       }, []);
@@ -1797,8 +1809,8 @@ window.__ModuleLoader__.load({
             h("div", { className: "vs-field-copy" }, h("div", { className: "vs-field-label" }, t("settings.embeddingModel"))),
             h("input", { value: draft.embeddingModel || "", onChange: (event) => update("embeddingModel", event.target.value), placeholder: "bge-m3" })),
           h("div", { className: "vs-field" },
-            h("div", { className: "vs-field-copy" }, h("div", { className: "vs-field-label" }, t("settings.embeddingKey")), h("div", { className: "vs-field-hint" }, t("settings.embeddingKeyHint"))),
-            h("input", { type: "password", value: draft.embeddingApiKey || "", onChange: (event) => update("embeddingApiKey", event.target.value), placeholder: t("settings.optional") })),
+            h("div", { className: "vs-field-copy" }, h("div", { className: "vs-field-label" }, t("settings.embeddingKey")), h("div", { className: "vs-field-hint" }, t(draft.embeddingApiKeyConfigured ? "settings.embeddingKeySaved" : "settings.embeddingKeyEmpty"))),
+            h("input", { type: "password", autoComplete: "new-password", value: draft.embeddingApiKey || "", onChange: (event) => update("embeddingApiKey", event.target.value), placeholder: draft.embeddingApiKeyConfigured ? "••••••••" : t("settings.optional") })),
           h("div", { className: "vs-field" },
             h("div", { className: "vs-field-copy" }, h("div", { className: "vs-field-label" }, t("settings.dimensions")), h("div", { className: "vs-field-hint" }, t("settings.dimensionsHint"))),
             h("input", { value: draft.embeddingDimensions || 1024, onChange: (event) => update("embeddingDimensions", Number(event.target.value) || 0) })),
@@ -1822,7 +1834,9 @@ window.__ModuleLoader__.load({
             h("div", { className: "vs-health-row" }, h("span", null, t("index.vectors")), h("b", null, formatNumber(status?.vectors ?? 0)))),
           h("div", { className: "vs-progress" }, h("span", { style: { width: `${status?.building ? status.buildProgress : status?.embeddingProgress ?? 0}%` } })),
           h("div", { className: "vs-actions-right" }, h(Button, { icon: "refresh", onClick: reindex, state: reindexState, disabled: busy }, t("action.reindex"))),
-          status?.embeddingError ? h("p", { className: "vs-muted", style: { color: "var(--dsw-alias-state-error-primary,#b23b3b)", marginTop: 8 } }, status.embeddingError) : null));
+          status?.embeddingError ? h("p", { className: "vs-muted", style: { color: "var(--dsw-alias-state-error-primary,#b23b3b)", marginTop: 8 } }, status.embeddingError) : null,
+          status?.indexingError ? h("p", { className: "vs-muted", style: { color: "var(--dsw-alias-state-error-primary,#b23b3b)", marginTop: 8 } }, status.indexingError) : null,
+          (status?.pending || status?.indexingError) ? h("div", { className: "vs-actions-right" }, h(Button, { icon: "refresh", onClick: reindex, disabled: busy }, t("action.retry"))) : null));
     }
 
     function VaultPage({ api, t: providedT }) {
@@ -1837,6 +1851,10 @@ window.__ModuleLoader__.load({
       const [searchSeed, setSearchSeed] = useState("");
       const [indexStatus, setIndexStatus] = useState(null);
       const [refreshState, setRefreshState] = useState("idle");
+      const [mountError, setMountError] = useState(api.mountError ?? "");
+      useEffect(() => api.subscribeMountError?.(setMountError), [api]);
+      const refreshSequence = useRef(0);
+      const operationSequence = useRef(0);
       const [reindexState, setReindexState] = useState("idle");
 
       const notify = (message, isError = false) => setNotice({ message, error: isError, id: Date.now() });
@@ -1847,39 +1865,46 @@ window.__ModuleLoader__.load({
       }, [notice]);
 
       const refresh = async () => {
+        const sequence = ++refreshSequence.current;
         try {
           const [nextStats, nextSettings] = await Promise.all([
             api.call("stats"),
             api.call("getSettings")
           ]);
-          setStats(nextStats);
-          setSettings(nextSettings);
+          if (sequence !== refreshSequence.current) return false;
+          if (sequence > operationSequence.current) {
+            setStats(nextStats);
+            setSettings(nextSettings);
+          }
           setError("");
           return true;
         } catch (caught) {
+          if (sequence !== refreshSequence.current) return false;
           setError(caught instanceof Error ? caught.message : String(caught));
           return false;
         } finally {
-          setLoading(false);
+          if (sequence === refreshSequence.current) setLoading(false);
         }
       };
 
       useEffect(() => { void refresh(); }, []);
 
       useEffect(() => {
-        if (!stats?.embedding?.enabled || stats.embedding.ready || stats.embedding.progress >= 100) return;
+        if (tab !== "dashboard" && tab !== "settings") return undefined;
         const id = setInterval(async () => {
           try {
             const status = await api.call("indexStatus");
             setIndexStatus(status);
-            if (!status.building && (status.embeddingReady || status.embeddingError)) {
+            if (!status.building && !status.pending && !status.embeddingError && !status.indexingError) {
               if (status.embeddingReady) await refresh();
               clearInterval(id);
             }
-          } catch {}
+          } catch (caught) {
+            console.warn("[vault-studio] index status failed", caught);
+          }
         }, 2200);
         return () => clearInterval(id);
-      }, [stats?.embedding?.enabled, stats?.embedding?.ready, stats?.embedding?.progress]);
+      }, [tab, stats?.embedding?.enabled, stats?.embedding?.ready, stats?.embedding?.progress]);
 
       useEffect(() => {
         if (tab !== "dashboard") return;
@@ -1932,9 +1957,10 @@ window.__ModuleLoader__.load({
 
       const toggleConversation = async () => {
         const next = !settings?.conversationEnabled;
+        const sequence = ++operationSequence.current;
         try {
-          const saved = await api.call("updateSettings", { ...(settings || {}), conversationEnabled: next });
-          setSettings(saved);
+          const saved = await api.call("updateSettings", { conversationEnabled: next });
+          if (sequence === operationSequence.current) setSettings(saved);
           notify(next ? t("access.enabled") : t("access.disabled"));
         } catch (caught) {
           notify(`${t("error.prefix")}${caught.message}`, true);
@@ -1942,9 +1968,10 @@ window.__ModuleLoader__.load({
       };
 
       const quickUpdate = async (patch) => {
+        const sequence = ++operationSequence.current;
         try {
-          const saved = await api.call("updateSettings", { ...(settings || {}), ...patch });
-          setSettings(saved);
+          const saved = await api.call("updateSettings", patch);
+          if (sequence === operationSequence.current) setSettings(saved);
           notify(t("settings.saved"));
           if (patch.indexMode || patch.watch) await refresh();
         } catch (caught) {
@@ -1984,7 +2011,10 @@ window.__ModuleLoader__.load({
             t(`tab.${id}`))));
 
       let body;
-      if (loading) body = h("div", { className: "vs-empty" }, h(Icon, { name: "refresh" }), t("loading"));
+      if (mountError) body = h("div", { className: "vs-empty" }, h(Icon, { name: "alert" }),
+        h("div", null, mountError),
+        h(Button, { icon: "refresh", onClick: () => { setMountError(""); void api.retryMount?.(); void refresh(); } }, t("action.retry")));
+      else if (loading) body = h("div", { className: "vs-empty" }, h(Icon, { name: "refresh" }), t("loading"));
       else if (error) body = h("div", { className: "vs-empty" }, h(Icon, { name: "alert" }), h("div", null, error), h("div", { style: { marginTop: 10 } }, h(Button, { icon: "refresh", onClick: refresh }, t("action.refresh"))));
       else if (!stats?.configured && tab === "dashboard") body = h(SetupView, { t, settings, api, onDone: refresh, notify });
       else if (tab === "dashboard") body = h(Dashboard, { stats, t, onReindex: reindex, onOpenSearch: openSearch, onOpenSettings: () => setTab("settings"), onOpenNote: openNote, onOpenNotes: () => setTab("notes"), settings, onToggleConversation: toggleConversation, onQuickUpdate: quickUpdate });
@@ -1992,7 +2022,10 @@ window.__ModuleLoader__.load({
       else if (tab === "notes") body = h(NotesView, { t, api, onNotice: notify, requestedPath, onRefreshStats: refresh });
       else body = h(SettingsView, { t, api, settings, onSaved: refresh, onNotice: notify });
 
-      return h("div", { className: "vs-root" }, h("style", null, CSS), header, tabs, body, h(Notice, { notice, onClose: () => setNotice(null) }));
+      return h("div", { className: "vs-root" }, h("style", null, CSS), header, tabs,
+
+        indexStatus?.indexingError ? h("div", { className: "vs-empty" }, h("div", null, indexStatus.indexingError)) : null,
+        body, h(Notice, { notice, onClose: () => setNotice(null) }));
     }
 
     const dictionaries = { en: DICT.en, zh: DICT.zh };
@@ -2010,10 +2043,57 @@ window.__ModuleLoader__.load({
         return () => { if (typeof unsubscribe === "function") unsubscribe(); };
       }, "obsidian-vault-studio: active locale");
 
-      const mounted = ctx.remote.$mount(remoteContribution);
-      mounted.catch(() => {});
+      let mounted;
+      let disposed = false;
+      let mounting = false;
+      let mountingGeneration = 0;
+      let remoteDisposer;
+      let mountError = "";
+      const mountErrorListeners = new Set();
+      const notifyMountError = (error) => {
+        mountError = error;
+        for (const listener of mountErrorListeners) listener(error);
+      };
+      const api = {
+        get mountError() { return mountError; },
+        subscribeMountError(listener) { mountErrorListeners.add(listener); return () => mountErrorListeners.delete(listener); }
+      };
+      const mount = () => {
+        if (disposed || mounting) return;
+        mounting = true;
+        const generation = ++mountingGeneration;
+        // Wrap synchronous host failures as well as asynchronous rejection.
+        mounted = Promise.resolve().then(() => ctx.remote.$mount(remoteContribution));
+        mounted.then((dispose) => {
+          if (generation !== mountingGeneration) {
+            if (typeof dispose === "function") void dispose();
+            return;
+          }
+          mounting = false;
+          remoteDisposer = typeof dispose === "function" ? dispose : null;
+          notifyMountError("");
+        }).catch((error) => {
+          if (disposed || generation !== mountingGeneration) return;
+          mounting = false;
+          notifyMountError(`Vault host registration failed: ${error instanceof Error ? error.message : String(error)}`);
+          console.error("[vault-studio] remote registration failed", error);
+        });
+      };
+      api.retryMount = () => {
+        if (disposed || mounting) return;
+        mountingGeneration += 1;
+        mount();
+      };
+      mount();
       ctx.effect(() => {
-        return () => { void mounted.then((dispose) => dispose()).catch(() => {}); };
+        return () => {
+          disposed = true;
+          mountingGeneration += 1;
+          mountErrorListeners.clear();
+          void mounted.then(() => {
+            if (typeof remoteDisposer === "function") remoteDisposer();
+          }).catch(() => {});
+        };
       }, "obsidian-vault-studio: remote contribution");
       ctx.effect(() => ctx.locale.register(NS, dictionaries), "obsidian-vault-studio: locale");
 
@@ -2039,7 +2119,9 @@ window.__ModuleLoader__.load({
         return result;
       }
 
-      const api = { call };
+      // Keep the original live API object: it exposes the remote function and
+      // the mountError accessor without copying or detaching either one.
+      api.call = call;
       ctx.slots.inject("main", () => ctx.slots.register({
         name: "main",
         key: PANEL_ID,

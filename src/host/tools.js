@@ -226,10 +226,11 @@ export function registerTools(ctx, service) {
           undoId: { type: "string", required: true },
           path: { type: "string", required: true },
           operation: { type: "string", required: true },
-          bytesAdded: { type: "number", required: true }
+          bytesAdded: { type: "number", required: true },
+          indexingError: { type: "string", required: true }
         }
       },
-      render: (_args, value) => text(`Saved to ${value.path}. Undo id: ${value.undoId}`)
+      render: (_args, value) => text(`Saved to ${value.path}. Undo id: ${value.undoId}${value.indexingError ? `\n\nIndexing warning: ${value.indexingError}` : ""}`)
     },
     async execute(args) {
       return service.applyWrite(args.proposalId);
@@ -239,7 +240,7 @@ export function registerTools(ctx, service) {
 
   ctx.tools.register(defineTool({
     name: "obsidian_undo_write",
-    description: "Undo a write applied in this session. This is destructive and requires user approval. Use only when the user explicitly asks to undo a specific write.",
+    description: "Undo a write previously applied in this vault, including after a restart. This is destructive and requires user approval. Use only when the user explicitly asks to undo a specific write.",
     parameters: {
       undoId: { type: "string", required: true, description: "Undo id returned by obsidian_apply_write." }
     },
@@ -249,7 +250,8 @@ export function registerTools(ctx, service) {
         additionalProperties: false,
         properties: {
           path: { type: "string", required: true },
-          undone: { type: "boolean", required: true }
+          undone: { type: "boolean", required: true },
+          indexingError: { type: "string", required: true }
         }
       },
       render: (_args, value) => text(value.undone ? `Undid write to ${value.path}.` : `Nothing was undone for ${value.path}.`)
@@ -274,14 +276,42 @@ export function registerTools(ctx, service) {
           embeddingReady: { type: "boolean", required: true },
           embeddingProgress: { type: "number", required: true },
           embeddingError: { type: "string", required: true },
+          indexingError: { type: "string", required: true },
+          indexingErrors: {
+            type: "array",
+            required: true,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                path: { type: "string", required: true },
+                error: { type: "string", required: true }
+              }
+            }
+          },
           chunks: { type: "number", required: true },
-          vectors: { type: "number", required: true }
+          vectors: { type: "number", required: true },
+          pending: { type: "number", required: true },
+          firstPendingChunk: {
+            required: true,
+            oneOf: [
+              { type: "null" },
+              {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  id: { type: "string", required: true },
+                  notePath: { type: "string", required: true }
+                }
+              }
+            ]
+          }
         }
       },
       render: (_args, value) => text(JSON.stringify(value, null, 2))
     },
     async execute() {
-      return service.status();
+      return service.indexStatus();
     },
     presentCall: () => present("read", "Obsidian index status")
   }));

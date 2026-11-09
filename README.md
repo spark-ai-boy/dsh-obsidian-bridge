@@ -90,14 +90,14 @@ Browse and read notes on the **Notes** page. Model writes follow a proposal flow
 | `obsidian_stats` | Read index, statistics, and workspace status |
 | `obsidian_propose_write` | Create a create/append proposal without writing |
 | `obsidian_apply_write` | Apply a proposal after your approval |
-| `obsidian_undo_write` | Undo a write from this session |
+| `obsidian_undo_write` | Undo an applied write, including after a restart |
 | `obsidian_index_status` | Check indexing and embedding progress |
 
 The plugin has no delete, move, rename, or overwrite tools.
 
 ## Privacy and safety
 
-- The index, vectors, settings, and usage counters are local. The plugin contains no telemetry and does not upload the vault.
+- The index, vectors, settings, and usage counters are local. The plugin contains no telemetry. **When you configure a remote embedding service, Markdown chunks are sent to that service for vectorization**, including its URL host outside your machine; use a loopback endpoint to keep embeddings local.
 - When **Allow vault context in conversations** is off, every `obsidian_*` Agent tool is denied before execution. Vault Studio's own search and browsing remain available.
 - The system prompt tells the model to report Obsidian tool failures and never bypass Vault Studio or the access switch through generic file tools.
 - The access switch only gates `obsidian_*` tools. For a hard boundary, also check DeepSeek Harness workspace/sandbox permissions so generic `read`, `grep`, and `bash` cannot reach the vault path.

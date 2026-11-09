@@ -20,7 +20,11 @@ export const Config = z.object({
   autoApproveWrites: z.boolean().default(false),
   watch: z.boolean().default(true),
   excludedFolders: z.string().default(".obsidian,.trash,.git,node_modules"),
-  maxChunkChars: z.number().default(2200)
+  maxChunkChars: z.number().default(2200),
+  embeddingBatchSize: z.number().default(24),
+  embeddingTimeoutMs: z.number().default(90000),
+  embeddingMaxRetries: z.number().default(3),
+  embeddingRetryDelayMs: z.number().default(250)
 });
 
 /**
@@ -61,9 +65,9 @@ export class VaultService extends TypertRemoteService {
     return this.index.listNotes(options ?? {});
   }
 
-  async readNote(path) {
+  async readNote(path, signal) {
     await this.initialized();
-    return this.index.readNote(path);
+    return this.index.readNote(path, signal);
   }
 
   async proposeWrite(request) {
@@ -71,18 +75,21 @@ export class VaultService extends TypertRemoteService {
     return this.index.proposeWrite(request ?? {});
   }
 
+  async finishWriteIndex() {
+    await this.index.rebuild({ embed: true }).catch(() => {});
+    return this.index.settleBackgroundIndex();
+  }
+
   async applyWrite(proposalId) {
     await this.initialized();
     const result = await this.index.applyWrite(proposalId);
-    await this.index.rebuild({ embed: true }).catch(() => {});
-    return result;
+    return { ...result, indexingError: await this.finishWriteIndex() };
   }
 
   async undoWrite(undoId) {
     await this.initialized();
     const result = await this.index.undoWrite(undoId);
-    await this.index.rebuild({ embed: true }).catch(() => {});
-    return result;
+    return { ...result, indexingError: await this.finishWriteIndex() };
   }
 
   async getSettings() {
@@ -100,9 +107,9 @@ export class VaultService extends TypertRemoteService {
     return this.index.updateSettings(settings ?? {});
   }
 
-  async testEmbedding(settings) {
+  async testEmbedding(settings, signal) {
     await this.initialized();
-    return this.index.testEmbedding(settings ?? {});
+    return this.index.testEmbedding(settings ?? {}, signal);
   }
 
   async reindex() {
@@ -136,7 +143,9 @@ export class VaultService extends TypertRemoteService {
   }
 
   async close() {
-    this.index.dispose();
+    // Signal cancellation first; dispose drains initialization and all index
+    // writes without waiting for a complete embedding pass before aborting.
+    await this.index.dispose();
   }
 }
 
@@ -174,22 +183,30 @@ function promptSection() {
 - If an obsidian_* tool fails, report the error. Never bypass Vault Studio by reading the vault through generic read, grep, bash, or editor tools; never bypass the user's vault access switch.
 - Writes are proposal-first: call obsidian_propose_write, show the user the returned path and diff, and call obsidian_apply_write only after explicit user confirmation. Never claim a note was saved before obsidian_apply_write succeeds.
 - Never delete, move, rename, or overwrite existing notes. Only create new notes and append to existing ones.
-- The whole vault is local; only the snippets you choose to read or cite leave the machine.
+- The index is local, but if a non-loopback embedding service is configured, Markdown chunks are sent to that service for vectorization. Do not claim the whole vault never leaves the machine.
 - The user controls Agent access with the "Allow vault context in conversations" switch in Vault Studio. When it is off, every obsidian_* tool is denied. Do not retry a denied call; explain that the user must enable the switch first.`;
 }
 
 async function approvalReason(service, exec) {
   if (exec.name === "obsidian_apply_write") {
-    let proposal = null;
+    let proposal;
     try {
       proposal = await service.proposalFor(exec.arguments?.proposalId);
     } catch {
-      // Fall through to the generic approval prompt; the tool reports the error.
+      return { kind: "deny", reason: "The pending proposal could not be verified.", displayReason: {
+        en: "Cannot verify this pending write; no note was changed.", zh: "无法核实待执行提案，未修改任何笔记。"
+      } };
     }
-    const path = proposal?.path ? `: ${proposal.path}` : "";
+    if (!proposal || proposal.status !== "proposed") {
+      return { kind: "deny", reason: "This write proposal no longer exists, was already applied, or belongs to a different vault. Do not retry without making a new proposal.", displayReason: {
+        en: "This proposal is no longer pending in the current vault.",
+        zh: "该提案已失效、已执行或不属于当前知识库，不能重复执行。"
+      } };
+    }
+    const path = proposal.path ? `: ${proposal.path}` : "";
     return {
       kind: "ask",
-      reason: `The agent wants to apply a pending write to the local Obsidian vault${path}.\n\n${(proposal?.diff || "").slice(0, 1800)}`,
+      reason: `The agent wants to apply a pending write to the local Obsidian vault${path}.\n\nReview the complete tool-call proposal shown below before approving. If no full diff is visible, deny and ask the agent to show it.\n\n${proposal.diff}\n\nOnly this proposal id may be applied: ${proposal.id}. Its content hash and the target's current content are validated again immediately before writing.`,
       displayReason: {
         en: `Apply this Obsidian write${path}?`,
         zh: `应用这次 Obsidian 写入${path}？`
@@ -216,8 +233,8 @@ async function approvalReason(service, exec) {
 export function apply(ctx, config) {
   const service = new VaultService(ctx, config ?? {});
 
-  ctx.effect(() => () => {
-    void service.close();
+  ctx.effect(() => async () => {
+    await service.close();
   }, "obsidian-vault-studio: close index");
 
   ctx.systemPrompt.section({
